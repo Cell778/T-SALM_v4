@@ -161,7 +161,9 @@ class sCLAPModelModule(BaseModelModule):
             'loss_logit_temporal': MeanMetric(),
             'loss_logit_spatial': MeanMetric(),
             'loss_logit_ts': MeanMetric(),
-            'loss_modality': MeanMetric()
+            'loss_modality': MeanMetric(),
+            'loss_local_align': MeanMetric(),
+            'loss_consistency': MeanMetric()
             }
         )
     
@@ -231,8 +233,8 @@ class sCLAPModelModule(BaseModelModule):
     ############################## Training functions ##############################
 
     def training_step(self, batch_sample, batch_idx):
-        is_triplet = (batch_sample['audio4sed'].dim() == 4)  # (B,3,C,T)
-        if  batch_sample['audio4sed'].dim() == 4:  # (B,3,C,T)
+        is_triplet = (batch_sample['audio4sed'].dim() >= 4 and batch_sample['audio4sed'].shape[1] == 3)
+        if is_triplet:  # (B,3,C,T)
             # Triplet batches from stClotho
             # - audio: flatten to candidates (B*3,...)
             # - text_sed: keep ONLY positives as anchors (B,...) for temporal hard-negative mining
@@ -241,7 +243,15 @@ class sCLAPModelModule(BaseModelModule):
             batch_sample['audio4doa'] = batch_sample['audio4doa'].flatten(0, 1)
             batch_sample['longer'] = batch_sample['longer'].flatten(0, 1)
             batch_sample['cart_doa'] = batch_sample['cart_doa'].flatten(0, 1)
-
+            
+            text_chunk1 = batch_sample.get('text_chunk1')
+            text_chunk2 = batch_sample.get('text_chunk2')
+            
+    
+    
+            # Note: ori_audio_duration is handled by _normalize_ori_audio_duration in sCLAP.get_audio_embedding
+            # We pass the raw structure (list of tensors/lists) directly.
+         
             text_sed = {k: v.flatten(0,1) for k, v in batch_sample['text_sed'].items()}
             text_comb = {k: v.flatten(0, 1) for k, v in batch_sample['text_comb'].items()}
         else:
@@ -249,9 +259,12 @@ class sCLAPModelModule(BaseModelModule):
             text_comb = batch_sample['text_comb']
 
         audio = {'audio4sed': batch_sample['audio4sed'], 
-                 'audio4doa': batch_sample['audio4doa']}
+                 'audio4doa': batch_sample['audio4doa'],
+                 'ori_audio_duration': batch_sample.get('ori_audio_duration')}
         text = {'text': text_sed,
-            'text_comb': text_comb}
+            'text_comb': text_comb,
+            'text_chunk1': text_chunk1,
+            'text_chunk2': text_chunk2}
         longer = batch_sample['longer']
         audio_features, text_features, doa = self.forward(audio, text, longer, normalize=False)
         # text_feature_doa = self.encode_direction_text()
@@ -318,19 +331,25 @@ class sCLAPModelModule(BaseModelModule):
        
             writer.add_histogram("temporal_alpha/hist", vals, global_step=self.global_step)
             
-        attn_weight = self.net._attn_weight_cache
-        
-        if batch_idx % 100 == 0 and attn_weight is not None:
-            self.logger.experiment.add_histogram(
+        writer = getattr(self.logger, "experiment", None)
+        attn_weight = getattr(self.net, "_attn_weight_cache", None)
+        if (
+            writer is not None
+            and batch_idx % 100 == 0
+            and isinstance(attn_weight, torch.Tensor)
+            and attn_weight.dim() >= 3
+            and attn_weight.size(1) >= 2
+        ):
+            writer.add_histogram(
                 'attn_weight_seg0', 
                 attn_weight[:, 0, :].flatten(), 
                 global_step=self.global_step
-        )
-            self.logger.experiment.add_histogram(
+            )
+            writer.add_histogram(
                 'attn_weight_seg1', 
                 attn_weight[:, 1, :].flatten(), 
                 global_step=self.global_step
-        )
+            )
 
         return total_loss['total_loss']
     
@@ -367,13 +386,15 @@ class sCLAPModelModule(BaseModelModule):
 
     def validation_step(self, batch_sample, batch_idx, dataloader_idx=0):
         # Triplet batches from stClotho: (B,3,C,T) -> (B*3,C,T)
-        if batch_sample['audio4sed'].dim() == 4:
+        if batch_sample['audio4sed'].dim() >= 4 and batch_sample['audio4sed'].shape[1] == 3:
             batch_sample['audio4sed'] = batch_sample['audio4sed'].flatten(0, 1)
             batch_sample['audio4doa'] = batch_sample['audio4doa'].flatten(0, 1)
             batch_sample['longer'] = batch_sample['longer'].flatten(0, 1)
             if 'cart_doa' in batch_sample:
                 batch_sample['cart_doa'] = batch_sample['cart_doa'].flatten(0, 1)
-
+                
+            # Note: See training_step for why manual flattening of ori_audio_duration is removed
+                
             for key in ['text_sed', 'text_comb']:
                 if key in batch_sample:
                     for k in batch_sample[key].keys():
@@ -388,7 +409,8 @@ class sCLAPModelModule(BaseModelModule):
             self.last_dataloader_idx = dataloader_idx
             self.reset_system_output()
         audio = {'audio4sed': batch_sample['audio4sed'], 
-                 'audio4doa': batch_sample['audio4doa']}
+                 'audio4doa': batch_sample['audio4doa'],
+                 'ori_audio_duration': batch_sample.get('ori_audio_duration')}
         text = {'text': batch_sample['text_sed'], 
                 'text_comb': batch_sample['text_comb']}
         longer = batch_sample['longer']
@@ -401,7 +423,7 @@ class sCLAPModelModule(BaseModelModule):
             for idx in range(len(text_features)):
                 text_features[idx] = F.normalize(text_features[idx], dim=-1)
         
-        self.system_output['all_audio_features'].append(audio_features[-1])
+        self.system_output['all_audio_features'].append(audio_features[0])
         # self.system_output['sed_audio_features'].append(audio_features[1])
         # self.system_output['doa_audio_features'].append(audio_features[2])
         self.system_output['all_text_features'].append(text_features[0])
@@ -427,13 +449,16 @@ class sCLAPModelModule(BaseModelModule):
 
     def test_step(self, batch_sample, batch_idx):
         # Triplet batches from stClotho: (B,3,C,T) -> (B*3,C,T)
-        if batch_sample['audio4sed'].dim() == 4:
+        if batch_sample['audio4sed'].dim() >= 4 and batch_sample['audio4sed'].shape[1] == 3:
             batch_sample['audio4sed'] = batch_sample['audio4sed'].flatten(0, 1)
             batch_sample['audio4doa'] = batch_sample['audio4doa'].flatten(0, 1)
             batch_sample['longer'] = batch_sample['longer'].flatten(0, 1)
             if 'cart_doa' in batch_sample:
                 batch_sample['cart_doa'] = batch_sample['cart_doa'].flatten(0, 1)
-
+                
+            
+            # Note: See training_step for why manual flattening of ori_audio_duration is removed
+                
             for key in ['text_sed', 'text_comb']:
                 if key in batch_sample:
                     for k in batch_sample[key].keys():
@@ -441,7 +466,8 @@ class sCLAPModelModule(BaseModelModule):
                             batch_sample[key][k] = batch_sample[key][k].flatten(0, 1)
 
         audio = {'audio4sed': batch_sample['audio4sed'], 
-                'audio4doa': batch_sample['audio4doa']}
+                'audio4doa': batch_sample['audio4doa'],
+                'ori_audio_duration': batch_sample.get('ori_audio_duration')}
         longer = batch_sample['longer']
         if self.cfg.task == 'zero-shot-classification (Direction)': 
             audio_features = self.forward(audio, None, longer)

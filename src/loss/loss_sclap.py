@@ -43,6 +43,12 @@ class sCLAPLoss:
 
         #3-way loss weight
         w_ts = weights_all[4] if len(weights_all) >=5 else w_sem
+        
+        #local alignment loss weight
+        w_local_align = weights_all[5] if len(weights_all) >=6 else 0.1
+        
+        #consistency loss weight
+        w_consist = weights_all[6] if len(weights_all) >=7 else 0.1
 
         #semantic loss weight
         w_sem_eff = w_sem
@@ -104,9 +110,9 @@ class sCLAPLoss:
             loss_doa = (1 - cos_sim).mean()
         
         device = audio_features[0].device
-        audio_feature_comb, audio_feature_sed, audio_feature_doa, audio_feature_temporal, audio_feature_triplet = audio_features
+        audio_feature_comb, audio_feature_sed, audio_feature_doa, audio_feature_temporal, audio_feature_triplet, chunk1_soft, chunk2_soft, chunk1_hard, chunk2_hard = audio_features
         # text_feature_comb, text_feature_sed, text_feature_doa = text_features
-        text_feature_comb, text_feature_sed = text_features
+        text_feature_comb, text_feature_sed, t_chunk1, t_chunk2 = text_features
         
         if self.mlp_loss: raise NotImplementedError
 
@@ -141,6 +147,8 @@ class sCLAPLoss:
             # temporal loss (v2) is only meaningful in triplet mode
             loss_logit_temporal = torch.zeros((), device=device)
             loss_logit_spatial = torch.zeros((), device=device)
+            loss_local_align = torch.zeros((), device=device)
+            loss_consistency = torch.zeros((), device=device)
         else:
 
             b = text_feature_sed.shape[0]
@@ -275,6 +283,27 @@ class sCLAPLoss:
             loss_logit_3way_a2t = F.cross_entropy(logits_3way_a2t, labels_3way_a2t)
 
             loss_logit_ts = (loss_logit_3way_t2a + loss_logit_3way_a2t) / 2
+            
+            #----Local Alignment----#
+            b1 = t_chunk1.shape[0]
+            labels_local = torch.arange(b1, device=device)
+            # Chunk 1
+            logits_c1 = logit_scale * (chunk1_soft @ t_chunk1.T)
+            loss_c1 = (F.cross_entropy(logits_c1, labels_local) + F.cross_entropy(logits_c1.T, labels_local)) / 2
+            
+            # Chunk 2
+            logits_c2 = logit_scale * (chunk2_soft @ t_chunk2.T)
+            loss_c2 = (F.cross_entropy(logits_c2, labels_local) + F.cross_entropy(logits_c2.T, labels_local)) / 2
+            
+            loss_local_align = (loss_c1 + loss_c2) / 2
+            
+            #----Consistency Loss between soft and hard chunk features----#
+            loss_consist_c1 = F.mse_loss(chunk1_soft, chunk1_hard)
+            loss_consist_c2 = F.mse_loss(chunk2_soft, chunk2_hard)
+            
+            loss_consistency = loss_consist_c1 + loss_consist_c2
+            
+            
 
         # loss_logit_doa = F.cross_entropy(logits_per_audio_doa, cls_doa)
 
@@ -289,6 +318,6 @@ class sCLAPLoss:
             'total_loss': 0.5 * loss_logit_spatial_semantic 
                 + w_sem_eff * loss_logit_semantic + w_doa * loss_doa + w_spatial_eff * loss_logit_spatial
                 + w_temp_eff * loss_logit_temporal
-                + w_ts_eff * loss_logit_ts
+                + w_ts_eff * loss_logit_ts + w_local_align * loss_local_align + w_consist * loss_consistency
 
         }

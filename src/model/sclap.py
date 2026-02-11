@@ -109,14 +109,19 @@ class sCLAP(nn.Module):
         return text_output
     
     def get_text_embedding(self, data):
-        """Get the text embedding from the model
+        """Get the text embedding from the model"""
+    # 强制要求 chunk captions 必须存在
+        if 'text_chunk1' not in data or data['text_chunk1'] is None:
+            raise KeyError("Missing required field 'text_chunk1' in text data (spatialized caption for chunk1).")
+        if 'text_chunk2' not in data or data['text_chunk2'] is None:
+            raise KeyError("Missing required field 'text_chunk2' in text data (spatialized caption for chunk2).")
 
-        """
-        
         text_comb_embeds = self.encode_text(data['text_comb'])
         text_sed_embeds = self.encode_text(data['text'])
+        chunk1_emb = self.encode_text(data['text_chunk1'])
+        chunk2_emb = self.encode_text(data['text_chunk2'])
 
-        return [text_comb_embeds, text_sed_embeds]
+        return [text_comb_embeds, text_sed_embeds, chunk1_emb, chunk2_emb]
 
     def encode_audio(self):
         raise NotImplementedError
@@ -432,7 +437,7 @@ class sCLAP_Dual(sCLAP):
         # ============================================================
         self.weights = nn.Parameter(torch.ones([joint_embed_dim]))
 
-        self.temporal_alpha = nn.Parameter(torch.tensor(0.1))
+        self.temporal_alpha = nn.Parameter(torch.tensor(1e-4))
         
         self.att_pool_sed = AttentionPooling(cfg.model.audio.output_dim)
         self.att_pool_doa = AttentionPooling(cfg.model.audio.output_dim)
@@ -453,6 +458,56 @@ class sCLAP_Dual(sCLAP):
     def encode_audio(self, audio1, audio2, longer_list=[]):
         return self.audio_branch(audio1, audio2, longer_list)
     
+    def _to_duration_pair(self, item):
+        if isinstance(item, torch.Tensor):
+            item = item.detach().cpu().tolist()
+        
+        if isinstance(item, (float, int)):
+            return float(item), 1.0
+
+        if isinstance(item, (list, tuple)):
+            d1 = float(item[0]) if len(item) > 0 else 1.0
+            d2 = float(item[1]) if len(item) > 1 else 1.0
+            return d1, d2
+            
+        return 1.0, 1.0
+
+    def _normalize_ori_audio_duration(self, ori_durations, batch_size: int):
+        # Case: Single Tensor (B, 2)
+        if isinstance(ori_durations, torch.Tensor):
+            t = ori_durations.detach().cpu()
+            if t.numel() == batch_size * 2:
+                t = t.reshape(batch_size, 2)
+                return [(float(t[i, 0]), float(t[i, 1])) for i in range(batch_size)]
+        
+        # Case: List of 3 Tensors (Triplet default collate) -> Interleave
+        if isinstance(ori_durations, (list, tuple)) and len(ori_durations) == 3 and batch_size % 3 == 0:
+            B0 = batch_size // 3
+            c0, c1, c2 = ori_durations
+            
+            def get_pair(c, idx):
+                if isinstance(c, torch.Tensor):
+                    return float(c[idx, 0]), float(c[idx, 1])
+                elif isinstance(c, (list, tuple)):
+                    return self._to_duration_pair(c[idx])
+                return 1.0, 1.0
+
+            len0 = len(c0) if hasattr(c0, '__len__') else 0
+            
+            if len0 == B0:
+                out = []
+                for i in range(B0):
+                    out.append(get_pair(c0, i))
+                    out.append(get_pair(c1, i))
+                    out.append(get_pair(c2, i))
+                return out
+
+        # Case: Already flattened list of correct length
+        if isinstance(ori_durations, (list, tuple)) and len(ori_durations) == batch_size:
+            return [self._to_duration_pair(x) for x in ori_durations]
+            
+        return [(1.0, 1.0)] * batch_size
+
     def get_audio_embedding(self, data, longer_list=[]):
         """Get the audio embedding from the model"""
 
@@ -465,74 +520,108 @@ class sCLAP_Dual(sCLAP):
             audio2[..., [nch]] = self.audio_scalar[nch](audio2[..., [nch]])
         audio2 = audio2.transpose(1, 3)
 
-        audio_output = self.encode_audio(audio1, audio2, longer_list)
-
-        audio_sed_embeds = self.audio_sed_projection(audio_output['sed_embedding'])
-        audio_doa_embeds = self.audio_doa_projection(audio_output['doa_embedding'])
-        audio_embeds = (audio_sed_embeds + self.weights * audio_doa_embeds) / 2
-
-        sed_feature_maps = audio_output['sed_feature_maps']  # (B, C, F, T)
-        doa_feature_maps = audio_output['doa_feature_maps']  # (B, C, F, T)
-
-        B, C, F, T = sed_feature_maps.shape
-        ori_durations = data['ori_audio_duration'] 
+        B, C, F, T = audio1.shape
+        ori_durations_raw = data.get('ori_audio_duration', None)
+        assert ori_durations_raw is not None, "audio dict missing key 'ori_audio_duration'"
+        ori_durations = self._normalize_ori_audio_duration(ori_durations_raw, B)
         
-        chunck1_embeds_list = []
-        chunck2_embeds_list = []
-    
+        audio1_list = []
+        audio2_list = []
+        split_indices = []
+        
+        # 1. Prepare 3xB batch data (Full, Chunk1_Hard, Chunk2_Hard)
         for i in range(B):
-            durs = ori_durations[i]
-            if isinstance(durs, torch.Tensor):
-                durs = durs.tolist()
-        
-            d1 = float(durs[0]) if len(durs) > 0 else 1.0
-            d2 = float(durs[1]) if len(durs) > 1 else 1.0
-            
-        
+            d1, d2 = ori_durations[i]
             total_duration = d1 + d2
             ratio = d1 / total_duration if total_duration > 0 else 0.5
             split_idx = int(T * ratio)
-            split_idx = max(1, min(split_idx, T - 1)) 
-                
-       
-            feat_s1_map = sed_feature_maps[i, :, :, :split_idx]  # (C, F, T1)
-            feat_d1_map = doa_feature_maps[i, :, :, :split_idx]  # (C, F, T1)
-            x_s1 = feat_s1_map.mean(dim=1).transpose(0, 1) # (C, T1) -> (T1, C)
-            x_d1 = feat_d1_map.mean(dim=1).transpose(0, 1) # (C, T1) -> (T1, C)
-            f1_s = self.att_pool_sed(x_s1)  # (C,)
-            f1_d = self.att_pool_doa(x_d1)  # (C,)
-
-        
-            feat_s2_map = sed_feature_maps[i, :, :, split_idx:]  # (C, F, T2)
-            feat_d2_map = doa_feature_maps[i, :, :, split_idx:]
-            x_s2 = feat_s2_map.mean(dim=1).transpose(0, 1) # (C, T2) -> (T2, C)
-            x_d2 = feat_d2_map.mean(dim=1).transpose(0, 1) # (C, T2) -> (T2, C)
-            f2_s = self.att_pool_sed(x_s2)  # (C,)
-            f2_d = self.att_pool_doa(x_d2)  # (C,)
+            split_idx = max(1, min(split_idx, T - 1))
+            split_indices.append(split_idx)
             
-          
-            emb1 = self.audio_temporal_projection(f1_s) + self.weights * self.audio_temporal_projection(f1_d)
-            emb2 = self.audio_temporal_projection(f2_s) + self.weights * self.audio_temporal_projection(f2_d)
+            full_a1, full_a2 = audio1[i], audio2[i]
+            
+            # Hard Split: Slice and Pad to T
+            c1_a1 = F.pad(full_a1[..., :split_idx], (0, T - split_idx))
+            c1_a2 = F.pad(full_a2[..., :split_idx], (0, T - split_idx))
+            
+            # Chunk 2 moved to start for position encoding consistency
+            c2_a1 = F.pad(full_a1[..., split_idx:], (0, split_idx))
+            c2_a2 = F.pad(full_a2[..., split_idx:], (0, split_idx))
+            
+            audio1_list.extend([full_a1, c1_a1, c2_a1])
+            audio2_list.extend([full_a2, c1_a2, c2_a2])
+
+        # Batch Encoding (3B samples)
+        audio1_batch = torch.stack(audio1_list, dim=0)
+        audio2_batch = torch.stack(audio2_list, dim=0)
+        
+        if isinstance(longer_list, torch.Tensor) and longer_list.numel() > 0:
+             longer_ids = longer_list.detach().cpu().tolist()
+             expanded_longer = torch.tensor([3 * idx for idx in longer_ids], device=longer_list.device)
+        else:
+            expanded_longer = []
+
+        audio_output = self.encode_audio(audio1_batch, audio2_batch, expanded_longer)
+
+        # 2. Extract All Global Embeddings
+        all_sed_embs = self.audio_sed_projection(audio_output['sed_embedding'])
+        all_doa_embs = self.audio_doa_projection(audio_output['doa_embedding'])
+        
+        def get_joint_emb(sed, doa):
+            return sed + self.weights * doa
+
+        all_audio_embs = get_joint_emb(all_sed_embs, all_doa_embs)
+        
+        full_idx = torch.arange(0, 3*B, 3, device=all_audio_embs.device)
+        hard1_idx = torch.arange(1, 3*B, 3, device=all_audio_embs.device)
+        hard2_idx = torch.arange(2, 3*B, 3, device=all_audio_embs.device)
+        
+        # Main Outputs
+        audio_embeds = all_audio_embs[full_idx]
+        audio_sed_embeds = all_sed_embs[full_idx]
+        audio_doa_embeds = all_doa_embs[full_idx]
+        
+        # Hard Chunk Embeds
+        chunck1_embeds_hard = all_audio_embs[hard1_idx].detach()
+        chunck2_embeds_hard = all_audio_embs[hard2_idx].detach()
+    
+        # 3. Soft Slicing (From FULL branch feature maps)
+        sed_feature_maps = audio_output['sed_feature_maps'][full_idx]
+        doa_feature_maps = audio_output['doa_feature_maps'][full_idx]
+
+        chunck1_embeds_list = []
+        chunck2_embeds_list = []
+        
+        for i in range(B):
+            split_idx = split_indices[i]
+            
+            # Soft Chunk 1
+            x_s1 = sed_feature_maps[i, ..., :split_idx].mean(dim=1).transpose(0, 1) # (T1, C)
+            x_d1 = doa_feature_maps[i, ..., :split_idx].mean(dim=1).transpose(0, 1) # (T1, C)
+            emb1 = get_joint_emb(self.audio_sed_projection(self.att_pool_sed(x_s1)), 
+                                 self.audio_doa_projection(self.att_pool_doa(x_d1)))
+
+            # Soft Chunk 2
+            x_s2 = sed_feature_maps[i, ..., split_idx:].mean(dim=1).transpose(0, 1) # (T2, C)
+            x_d2 = doa_feature_maps[i, ..., split_idx:].mean(dim=1).transpose(0, 1) # (T2, C)
+            emb2 = get_joint_emb(self.audio_sed_projection(self.att_pool_sed(x_s2)), 
+                                 self.audio_doa_projection(self.att_pool_doa(x_d2)))
                 
             chunck1_embeds_list.append(emb1)
             chunck2_embeds_list.append(emb2)
         
-      
         chunck1_embeds = torch.stack(chunck1_embeds_list, dim=0)
         chunck2_embeds = torch.stack(chunck2_embeds_list, dim=0)
         
-        temporal_seq = torch.stack([chunck1_embeds, chunck2_embeds], dim=1)  # (B, 2, D)
+        temporal_seq = torch.stack([chunck1_embeds, chunck2_embeds], dim=1)
         audio_temporal_embeds = self.audio_temporal_encoder(temporal_seq) 
 
         audio_triplet_embeds = audio_embeds + self.temporal_alpha * self.final_audio_projection(audio_temporal_embeds)
-        # audio_embeds = self.audio_projection(
-        #     torch.cat([audio_sed_embeds, audio_doa_embeds], dim=-1))
-
-        # audio_embeds = F.normalize(audio_embeds, dim=-1)
-        # audio_sed_embeds = F.normalize(audio_sed_embeds, dim=-1)
-        # audio_doa_embeds = F.normalize(audio_doa_embeds, dim=-1)
         
-        return [audio_embeds, audio_sed_embeds, audio_doa_embeds, audio_temporal_embeds, audio_triplet_embeds]
+        return [audio_embeds, audio_sed_embeds, audio_doa_embeds, 
+                audio_temporal_embeds, audio_triplet_embeds, 
+                chunck1_embeds, chunck2_embeds, 
+                chunck1_embeds_hard, chunck2_embeds_hard]
 
     def forward(self, audio, text, longer_list=[]):
         """Forward audio and text into the sCLAP"""
@@ -543,7 +632,8 @@ class sCLAP_Dual(sCLAP):
         audio_embedding = [F.normalize(x, dim=-1) for x in audio_embedding]
         text_embedding = [F.normalize(x, dim=-1) for x in text_embedding]
         
-        doa = self.fc_doa(audio_embedding[-1])
+        # Use audio_triplet_embeds (index 4) for DOA prediction
+        doa = self.fc_doa(audio_embedding[4]) 
         if doa.dim() == 2:
             b = doa.shape[0]
             doa = doa.view(b, self.n_events, 3)

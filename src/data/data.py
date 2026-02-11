@@ -271,8 +271,18 @@ class sCLAPDataset(BaseDataset):
 
             if cart_doa is None:
                 cart_doa = torch.stack([x, y, z], dim=0).unsqueeze(0)
+            
+            # Extract local captions for chunks if available
+            if isinstance(metadata, dict) and 'audio_segments' in metadata:
+                seg_caps = [
+                    metadata['audio_segments'][0]['metadata']['spatialized_caption'],
+                    metadata['audio_segments'][1]['metadata']['spatialized_caption']
+                ]
+            else:
+                # Fallback to global spatialized captions if no segments exist
+                seg_caps = [spatialized_caption, spatialized_caption]
 
-            return caption, spatialized_caption, direction, cart_doa, ori_audio_duration
+            return caption, spatialized_caption, direction, cart_doa, ori_audio_duration, seg_caps
 
         audioitem = self.audiofiles[idx]
         metaitem = self.metafiles[idx] if len(self.metafiles) > idx else None
@@ -335,7 +345,7 @@ class sCLAPDataset(BaseDataset):
                 metafile = str(audiofile).replace('/audio/', '/metadata/').replace('.flac', '.json')
                 if metaitem is not None:
                     metafile = str(metaitem)
-                caption, spatialized_caption, direction, cart_doa, ori_audio_duration = _parse_caption_and_doa(metafile)
+                caption, spatialized_caption, direction, cart_doa, ori_audio_duration, seg_caps = _parse_caption_and_doa(metafile)
             else:
                 # Triplet: each audio reads its OWN metadata json.
                 if isinstance(metaitem, (tuple, list)) and len(metaitem) == 3:
@@ -353,6 +363,7 @@ class sCLAPDataset(BaseDataset):
                 directions = [p[2] for p in parsed]
                 cart_doas = [p[3] for p in parsed]
                 ori_audio_durations = [p[4] for p in parsed]
+                chunks_caps = [p[5] for p in parsed] # list of [seg1_caps, seg2_caps] for each 
         elif self.dataset_name in ['Clotho', 'AudioCaps'] and self.dataset_type == 'test':
             if -22.5 < azi <= 22.5: direction = 'south'
             elif 22.5 < azi <= 67.5: direction = 'southeast'
@@ -370,6 +381,7 @@ class sCLAPDataset(BaseDataset):
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
+        text_chunk1 = text_chunk2 = None
         if not is_triplet:
             if self.dataset_type == 'train':
                 cap_i = random.randint(0, len(caption) - 1)
@@ -377,6 +389,10 @@ class sCLAPDataset(BaseDataset):
                 spatialized_caption = spatialized_caption[cap_i]
                 text = self.tokenize(caption)
                 text_comb = self.tokenize(spatialized_caption)
+                
+                # Tokenize chunk captions for local alignment
+                text_chunk1 = self.tokenize(seg_caps[0][cap_i])
+                text_chunk2 = self.tokenize(seg_caps[1][cap_i])
             else:
                 text = [self.tokenize(t) for t in caption]
                 text_comb = [self.tokenize(t) for t in spatialized_caption]
@@ -397,6 +413,10 @@ class sCLAPDataset(BaseDataset):
                 text_comb_list = [self.tokenize(c) for c in spatialized_caption]
                 text = {k: torch.stack([t[k] for t in text_list], dim=0) for k in text_list[0].keys()}
                 text_comb = {k: torch.stack([t[k] for t in text_comb_list], dim=0) for k in text_comb_list[0].keys()}
+
+                # Tokenize chunk captions for the first item in triplet (usually Positive)
+                text_chunk1 = self.tokenize(chunks_caps[0][0][cap_i])
+                text_chunk2 = self.tokenize(chunks_caps[0][1][cap_i])
             else:
                 k = min(len(c) for c in captions)
                 k = min(k, *(len(sc) for sc in spatial_caps))
@@ -426,6 +446,8 @@ class sCLAPDataset(BaseDataset):
             'ori_caption': caption,
             'text_comb': text_comb,
             'text_sed': text,
+            'text_chunk1': text_chunk1,
+            'text_chunk2': text_chunk2,
             'cls_doa': (torch.tensor([self.direction_label_dict[d] for d in direction], dtype=torch.long)
                         if isinstance(direction, (list, tuple)) else self.direction_label_dict[direction]),
             'cart_doa': cart_doa,
