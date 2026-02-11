@@ -1,0 +1,11 @@
+- task=spatial_retrieval
+- mode=valid
+- ckpt_path=/gpfs/work/int/peiweiren25/Temporal_SALM/T-SALM_v4/logs/spatial-retrieval/runs/2026-01-26_06-57-29/checkpoints/epoch_009.ckpt
+- paths.dataset_dir=/gpfs/work/int/peiweiren25/Temporal_SALM/T-SALM_v4/datasets
+- +data.valid_dataset.sClotho=[test]
+- trainer.accelerator=gpu
+- trainer.devices=1
+- trainer.precision=32
+- num_workers=8
+- +model.n_events=2
+- data.truncation=fusion

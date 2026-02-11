@@ -1,0 +1,26 @@
+# @package _global_
+defaults:
+  - override /data: default-spatial-all.yaml
+  - override /task: zero_shot_doa
+  - _self_
+
+datamodule:
+  _target_: data.datamodule.DataModule
+
+modelmodule:
+  _target_: model.model_module.sCLAPModelModule
+
+model:
+  batch_size: 64
+  audio:
+    seld_method: EINV2
+    ckpt_path:
+      - ckpts/EINV2-HTSAT-0.514.ckpt
+      - ckpts/CLAP/630k-audioset-best.pt
+  text:
+    ckpt_path: ckpts/CLAP/630k-audioset-best.pt
+  loss_weights: [1.0, 0.5]
+
+doa_feature_type: 2
+trainer:
+  max_epochs: 10

@@ -1,0 +1,23 @@
+[2026-01-26 13:46:35,059][utils.utilities][INFO] - Printing config tree with Rich! <cfg.extras.print_config=True>
+[2026-01-26 13:46:35,115][__main__][INFO] - Instantiating datamodule <data.datamodule.DataModule> ...
+[2026-01-26 13:46:37,161][data.datamodule][INFO] - Training clip number of sClotho is: 13000
+[2026-01-26 13:46:38,265][data.datamodule][INFO] - Training clip number of sAudioCaps is: 0
+[2026-01-26 13:46:38,265][data.datamodule][INFO] - Training clip number is: 13000
+[2026-01-26 13:46:39,978][data.datamodule][INFO] - Validation clip number of sClotho is: 3000
+[2026-01-26 13:46:41,086][data.datamodule][INFO] - Validation clip number of sAudioCaps is: 0
+[2026-01-26 13:46:41,086][__main__][INFO] - Instantiating model <model.model_module.sCLAPModelModule> ...
+[2026-01-26 13:46:41,149][__main__][INFO] - Instantiating loggers...
+[2026-01-26 13:46:41,149][utils.utilities][INFO] - Instantiating logger <lightning.pytorch.loggers.tensorboard.TensorBoardLogger>
+[2026-01-26 13:46:41,152][__main__][INFO] - Instantiating trainer <lightning.pytorch.trainer.Trainer>
+[2026-01-26 13:46:41,224][__main__][INFO] - Logging hyperparameters!
+[2026-01-26 13:46:41,301][__main__][INFO] - Starting validation!
+[2026-01-26 13:46:43,378][model.model_module][INFO] - Number of parameters of the net: 190158441
+[2026-01-26 13:46:43,379][model.model_module][INFO] - Number of parameters of the audio encoder: 55098336
+[2026-01-26 13:46:43,379][model.model_module][INFO] - Number of parameters of the text encoder: 124645632
+[2026-01-26 13:49:52,166][model.model_module][INFO] - sAudioCaps, logits_per_audio_comb shape: torch.Size([3000, 15000]), logits_per_text_comb shape: torch.Size([15000, 3000])
+[2026-01-26 13:49:53,517][model.model_module][INFO] - valid sAudioCaps: 
+STAT: num_samples: 3000	loss_logit: 6.1699	
+TEXT_TO_AUDIO: R@1: 0.0856	R@5: 0.2610	R@10: 0.3855	mAP@10: 0.1608	
+AUDIO_TO_TEXT: R@1: 0.1133	R@5: 0.2630	R@10: 0.3520	mAP@10: 0.0883	
+DOA: LE: 24.2641	loss_doa: 0.1811	
+
