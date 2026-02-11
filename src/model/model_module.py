@@ -310,7 +310,31 @@ class sCLAPModelModule(BaseModelModule):
         for key, loss in total_loss.items():
             self.train_loss[key].update(loss)
         # return total_loss['loss_doa']
+        if hasattr(self.logger, "experiment"):
+            writer = self.logger.experiment  # SummaryWriter
+            vals = self.net.temporal_alpha.detach().cpu().numpy()
+       
+            writer.add_scalar("temporal_alpha/mean", float(vals.mean()), global_step=self.global_step)
+       
+            writer.add_histogram("temporal_alpha/hist", vals, global_step=self.global_step)
+            
+        attn_weight = self.net._attn_weight_cache
+        
+        if batch_idx % 100 == 0 and attn_weight is not None:
+            self.logger.experiment.add_histogram(
+                'attn_weight_seg0', 
+                attn_weight[:, 0, :].flatten(), 
+                global_step=self.global_step
+        )
+            self.logger.experiment.add_histogram(
+                'attn_weight_seg1', 
+                attn_weight[:, 1, :].flatten(), 
+                global_step=self.global_step
+        )
+
         return total_loss['total_loss']
+    
+    
 
     @torch.no_grad()
     def on_train_batch_end(self, outputs, batch, batch_idx):

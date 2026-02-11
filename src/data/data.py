@@ -79,6 +79,7 @@ class CLAPDataset(BaseDataset):
         #### Audio Retrieval ####
         # Clotho and AudioCaps dataset has 5 captions for each audio file
         elif self.dataset_name in ['Clotho', 'AudioCaps', 'sClotho', 'sAudioCaps', 'Freesound', 'sFreesound']:
+            ori_audio_duration = -1.0
             if self.dataset_name in ['Clotho', 'AudioCaps']:
                 raw_text = self.texts[audiofile.name]
             elif self.dataset_name in ['sClotho', 'sAudioCaps']:
@@ -86,6 +87,8 @@ class CLAPDataset(BaseDataset):
                 with open(metafile, 'r') as f:
                     metadata = json.load(f)
                 raw_text = metadata['spatialized_caption']
+                assert 'ori_audio_duration' in metadata, f"Missing ori_audio_duration in {metafile}"
+                ori_audio_duration = metadata['ori_audio_duration']
             if self.dataset_type == 'train':
                 raw_text = random.choice(raw_text)
                 text = self.tokenize(raw_text)
@@ -99,7 +102,8 @@ class CLAPDataset(BaseDataset):
             'audio': audio,
             'raw_text': raw_text,
             'text': text,
-            'longer': longer
+            'longer': longer,
+            'ori_audio_duration': ori_audio_duration
         }
         return sample
     
@@ -194,6 +198,12 @@ class sCLAPDataset(BaseDataset):
                 if not isinstance(segments, list) or len(segments) == 0:
                     raise KeyError(f"Invalid audio_segments in {metafile_path}")
 
+                ori_audio_duration = []
+                for seg in segments:
+                    seg_meta = seg.get('metadata', {})
+                    assert 'ori_audio_duration' in seg_meta, f"Missing ori_audio_duration in segment of {metafile_path}"
+                    ori_audio_duration.append(seg_meta['ori_audio_duration'])
+
                 if len(segments) < 2:
                     raise KeyError(f"Need >=2 audio_segments in {metafile_path}")
                 seg0_meta = segments[0].get('metadata', {})
@@ -248,6 +258,8 @@ class sCLAPDataset(BaseDataset):
                 caption = metadata['caption']
                 azi, ele = metadata['azi'], metadata['ele']
                 direction = metadata['direction']
+                assert 'ori_audio_duration' in metadata, f"Missing ori_audio_duration in {metafile_path}"
+                ori_audio_duration = metadata['ori_audio_duration']
 
             azi_f = _to_angle(azi)
             ele_f = _to_angle(ele)
@@ -260,7 +272,7 @@ class sCLAPDataset(BaseDataset):
             if cart_doa is None:
                 cart_doa = torch.stack([x, y, z], dim=0).unsqueeze(0)
 
-            return caption, spatialized_caption, direction, cart_doa
+            return caption, spatialized_caption, direction, cart_doa, ori_audio_duration
 
         audioitem = self.audiofiles[idx]
         metaitem = self.metafiles[idx] if len(self.metafiles) > idx else None
@@ -323,7 +335,7 @@ class sCLAPDataset(BaseDataset):
                 metafile = str(audiofile).replace('/audio/', '/metadata/').replace('.flac', '.json')
                 if metaitem is not None:
                     metafile = str(metaitem)
-                caption, spatialized_caption, direction, cart_doa = _parse_caption_and_doa(metafile)
+                caption, spatialized_caption, direction, cart_doa, ori_audio_duration = _parse_caption_and_doa(metafile)
             else:
                 # Triplet: each audio reads its OWN metadata json.
                 if isinstance(metaitem, (tuple, list)) and len(metaitem) == 3:
@@ -340,6 +352,7 @@ class sCLAPDataset(BaseDataset):
                 spatial_caps = [p[1] for p in parsed]
                 directions = [p[2] for p in parsed]
                 cart_doas = [p[3] for p in parsed]
+                ori_audio_durations = [p[4] for p in parsed]
         elif self.dataset_name in ['Clotho', 'AudioCaps'] and self.dataset_type == 'test':
             if -22.5 < azi <= 22.5: direction = 'south'
             elif 22.5 < azi <= 67.5: direction = 'southeast'
@@ -353,6 +366,7 @@ class sCLAPDataset(BaseDataset):
             caption = self.texts[audiofile.name]
             spatialized_caption = [f'The sound "{caption}" is coming from the {direction}.']
             cart_doa = torch.zeros((1, 3), dtype=torch.float32)
+            ori_audio_duration = -1.0
         else:
             raise ValueError(f"Unknown dataset: {self.dataset_name}")
 
@@ -369,6 +383,7 @@ class sCLAPDataset(BaseDataset):
                 text = {k: torch.stack([t[k] for t in text], dim=0) for k in text[0].keys()}
                 text_comb = {k: torch.stack([t[k] for t in text_comb], dim=0) for k in text_comb[0].keys()}
         else:
+            ori_audio_duration = ori_audio_durations # Use list for triplet
             if self.dataset_type == 'train':
                 min_len = min(len(c) for c in captions)
                 min_len = min(min_len, *(len(sc) for sc in spatial_caps))
@@ -415,6 +430,7 @@ class sCLAPDataset(BaseDataset):
                         if isinstance(direction, (list, tuple)) else self.direction_label_dict[direction]),
             'cart_doa': cart_doa,
             'longer': longer,
+            'ori_audio_duration': ori_audio_duration
         }
         return sample
 

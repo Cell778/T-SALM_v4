@@ -11,6 +11,17 @@ from .component.htsat import HTSAT_Swin_Transformer
 
 torch.serialization.add_safe_globals([numpy.core.multiarray.scalar])
 
+class AttentionPooling(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.w = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        scores = self.w(x) 
+        weights = F.softmax(scores, dim=-2) 
+        output = torch.sum(x * weights, dim=-2)
+        return output
+
 class GradientReversalFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, alpha):
@@ -260,6 +271,7 @@ class sCLAP_Single(sCLAP):
         else: ValueError('Unknown text encoder checkpoint: {}'.format(text_path))
 
 
+
 #Temporal embedding encoder
 class TemporalAudioEncoder(nn.Module):
 
@@ -300,13 +312,13 @@ class TemporalAudioEncoder(nn.Module):
         )
 
     def _get_sin_cos(self, seq_len, device, dtype):
-        dim = self.embedding_dim
+        dim = self.head_dim
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device).float() / dim))
         positions = torch.arange(seq_len, device=device).type_as(inv_freq).unsqueeze(1)
         freqs = positions * inv_freq.unsqueeze(0)  # (seq_len, dim/2)
         sin = torch.sin(freqs)
         cos = torch.cos(freqs)
-        # repeat each value twice to match embedding dim
+        # repeat each value twice to match head_dim
         sin = sin.repeat_interleave(2, dim=-1).type(dtype)
         cos = cos.repeat_interleave(2, dim=-1).type(dtype)
         return sin, cos
@@ -320,15 +332,19 @@ class TemporalAudioEncoder(nn.Module):
         return x_rot.reshape(x_shape)
 
     def _apply_rope(self, x, sin, cos):
-        # x: (B, T, D), sin/cos: (T, D)
-        return x * cos.unsqueeze(0) + self._rotate_every_two(x) * sin.unsqueeze(0)
+        # x: (B, H, T, head_dim), sin/cos: (T, head_dim)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        return x * cos + self._rotate_every_two(x) * sin
 
     def _multi_head_self_attention(self, x, layer):
         # x: (B, T, D)
         B, T, D = x.size()
-        q = layer['q_proj'](x)
-        k = layer['k_proj'](x)
-        v = layer['v_proj'](x)
+        
+        # Project and reshape to (B, H, T, head_dim)
+        q = layer['q_proj'](x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = layer['k_proj'](x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = layer['v_proj'](x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         device = x.device
         dtype = x.dtype
@@ -337,15 +353,10 @@ class TemporalAudioEncoder(nn.Module):
         q = self._apply_rope(q, sin, cos)
         k = self._apply_rope(k, sin, cos)
 
-        # reshape for heads
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)  # (B, H, T, head)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         attn = torch.softmax(scores, dim=-1)
         attn = layer['dropout'](attn)
-        out = torch.matmul(attn, v)  # (B, H, T, head)
+        out = torch.matmul(attn, v)  # (B, H, T, head_dim)
         out = out.transpose(1, 2).contiguous().view(B, T, D)
         out = layer['out_proj'](out)
         return out
@@ -422,6 +433,9 @@ class sCLAP_Dual(sCLAP):
         self.weights = nn.Parameter(torch.ones([joint_embed_dim]))
 
         self.temporal_alpha = nn.Parameter(torch.tensor(0.1))
+        
+        self.att_pool_sed = AttentionPooling(cfg.model.audio.output_dim)
+        self.att_pool_doa = AttentionPooling(cfg.model.audio.output_dim)
 
         if cfg.ckpt_path is None: 
             self.load_pretrained_weights(cfg.model.audio.ckpt_path[0], 
@@ -440,9 +454,8 @@ class sCLAP_Dual(sCLAP):
         return self.audio_branch(audio1, audio2, longer_list)
     
     def get_audio_embedding(self, data, longer_list=[]):
-        """Get the audio embedding from the model
+        """Get the audio embedding from the model"""
 
-        """
         audio1, audio2 = data['audio4sed'], data['audio4doa']
         # Compute audio4sed scalar
         audio1 = self.audio_scalar[0](audio1.transpose(1, 3)).transpose(1, 3)
@@ -462,26 +475,56 @@ class sCLAP_Dual(sCLAP):
         doa_feature_maps = audio_output['doa_feature_maps']  # (B, C, F, T)
 
         B, C, F, T = sed_feature_maps.shape
+        ori_durations = data['ori_audio_duration'] 
+        
+        chunck1_embeds_list = []
+        chunck2_embeds_list = []
+    
+        for i in range(B):
+            durs = ori_durations[i]
+            if isinstance(durs, torch.Tensor):
+                durs = durs.tolist()
+        
+            d1 = float(durs[0]) if len(durs) > 0 else 1.0
+            d2 = float(durs[1]) if len(durs) > 1 else 1.0
+            
+        
+            total_duration = d1 + d2
+            ratio = d1 / total_duration if total_duration > 0 else 0.5
+            split_idx = int(T * ratio)
+            split_idx = max(1, min(split_idx, T - 1)) 
+                
+       
+            feat_s1_map = sed_feature_maps[i, :, :, :split_idx]  # (C, F, T1)
+            feat_d1_map = doa_feature_maps[i, :, :, :split_idx]  # (C, F, T1)
+            x_s1 = feat_s1_map.mean(dim=1).transpose(0, 1) # (C, T1) -> (T1, C)
+            x_d1 = feat_d1_map.mean(dim=1).transpose(0, 1) # (C, T1) -> (T1, C)
+            f1_s = self.att_pool_sed(x_s1)  # (C,)
+            f1_d = self.att_pool_doa(x_d1)  # (C,)
 
-        chunck = T // 2
-
-        sed_chunck1 = sed_feature_maps[:,:,:,:chunck].mean(dim=(2,3))
-        sed_chunck2 = sed_feature_maps[:,:,:,chunck:].mean(dim=(2,3))
-
-        doa_chunck1 = doa_feature_maps[:,:,:,:chunck].mean(dim=(2,3))
-        doa_chunck2 = doa_feature_maps[:,:,:,chunck:].mean(dim=(2,3))
-
-        chunck1_embeds = self.audio_temporal_projection(sed_chunck1) + \
-                        self.weights * self.audio_temporal_projection(doa_chunck1)
-        chunck2_embeds = self.audio_temporal_projection(sed_chunck2) + \
-                        self.weights * self.audio_temporal_projection(doa_chunck2)
-
+        
+            feat_s2_map = sed_feature_maps[i, :, :, split_idx:]  # (C, F, T2)
+            feat_d2_map = doa_feature_maps[i, :, :, split_idx:]
+            x_s2 = feat_s2_map.mean(dim=1).transpose(0, 1) # (C, T2) -> (T2, C)
+            x_d2 = feat_d2_map.mean(dim=1).transpose(0, 1) # (C, T2) -> (T2, C)
+            f2_s = self.att_pool_sed(x_s2)  # (C,)
+            f2_d = self.att_pool_doa(x_d2)  # (C,)
+            
+          
+            emb1 = self.audio_temporal_projection(f1_s) + self.weights * self.audio_temporal_projection(f1_d)
+            emb2 = self.audio_temporal_projection(f2_s) + self.weights * self.audio_temporal_projection(f2_d)
+                
+            chunck1_embeds_list.append(emb1)
+            chunck2_embeds_list.append(emb2)
+        
+      
+        chunck1_embeds = torch.stack(chunck1_embeds_list, dim=0)
+        chunck2_embeds = torch.stack(chunck2_embeds_list, dim=0)
+        
         temporal_seq = torch.stack([chunck1_embeds, chunck2_embeds], dim=1)  # (B, 2, D)
         audio_temporal_embeds = self.audio_temporal_encoder(temporal_seq) 
 
         audio_triplet_embeds = audio_embeds + self.temporal_alpha * self.final_audio_projection(audio_temporal_embeds)
-        
-        
         # audio_embeds = self.audio_projection(
         #     torch.cat([audio_sed_embeds, audio_doa_embeds], dim=-1))
 
